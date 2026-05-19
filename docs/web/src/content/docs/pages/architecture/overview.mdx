@@ -92,7 +92,7 @@ A request enters via axum, the runtime hashes its stream ID to `(core, raft_grou
 The `GroupEngine` trait (in `ursula-runtime`) is the seam between the runtime and a group's storage / replication strategy. Three implementations ship today:
 
 - **`InMemoryGroupEngine`** - non-replicated, in-process. Used in tests and as a perf baseline.
-- **WAL-backed `RaftGroupEngine`** (with `--wal-dir`) - OpenRaft-driven consensus over a per-group JSON log file plus a shared per-core journal for durable Raft state.
+- **WAL-backed `RaftGroupEngine`** (with `--wal-dir`) - OpenRaft-driven consensus over protobuf-framed per-group Raft log records plus a shared per-core journal for durable Raft state.
 - **Memory-log `RaftGroupEngine`** (with `--raft-memory`) - OpenRaft with an in-memory log store for fast iteration. Not durable across restarts.
 
 A factory selected at startup (`InMemoryGroupEngineFactory` / `WalGroupEngineFactory`) decides which engine each `GroupActor` opens. This keeps the runtime code identical across modes and gives a clean upgrade path to additional engines (e.g., cold-only read replicas) without changes to the request routing layer.

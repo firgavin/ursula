@@ -2086,7 +2086,7 @@ Raft gRPC/HTTP2 rather than in the Durable Streams state machine:
 hyper::proto::h2::server::H2Stream
 tonic RaftInternal::append
 h2 frame/header decode and response send
-rmp_serde decode
+rmp_serde decode (the RPC path has since moved to typed protobuf messages)
 ```
 
 The runtime metrics explained why: enabling the S3 cold path also enabled cold

@@ -7,8 +7,6 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::future::Future;
 use std::io;
-use std::io::BufRead;
-use std::io::BufReader;
 use std::io::Cursor;
 use std::io::Read;
 use std::io::Write;
@@ -34,6 +32,7 @@ use openraft::OptionalSend;
 use openraft::Raft;
 use openraft::RaftNetworkFactory;
 use openraft::RaftNetworkV2;
+use openraft::StoredMembership;
 use openraft::alias::EntryOf;
 use openraft::alias::LogIdOf;
 use openraft::alias::SnapshotDataOf;
@@ -62,12 +61,12 @@ use openraft::storage::RaftLogStorage;
 use openraft::storage::RaftSnapshotBuilder;
 use openraft::storage::RaftStateMachine;
 use openraft::type_config::alias::SnapshotOf as TypeConfigSnapshotOf;
+use openraft::vote::RaftLeaderId;
 use prost::Message;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
 use serde::Serializer;
-use serde::de::DeserializeOwned;
 use tonic::transport::Channel;
 use tonic::transport::Endpoint;
 use ursula_proto as raft_app_proto;
@@ -1240,9 +1239,6 @@ pub const RAFT_GRPC_FORWARD_HTTP_WRITE_PATH: &str = "/ursula.raft.v1.RaftInterna
 pub const RAFT_GRPC_GROUP_WRITE_PATH: &str = "/ursula.raft.v1.RaftInternal/GroupWrite";
 pub const RAFT_GRPC_GROUP_READ_PATH: &str = "/ursula.raft.v1.RaftInternal/GroupRead";
 pub const RAFT_GRPC_MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
-// Protobuf is only the stable gRPC envelope. OpenRaft/domain payload bytes use
-// one serde codec so Rust command/state-machine schemas stay authoritative.
-pub const RAFT_RPC_PAYLOAD_CODEC: &str = "openraft-rmp-serde-v1";
 const RAFT_GRPC_PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Debug)]
@@ -1269,13 +1265,6 @@ impl GrpcRpcError {
     fn not_found(message: impl Into<String>) -> Self {
         Self {
             code: tonic::Code::NotFound,
-            message: message.into(),
-        }
-    }
-
-    fn internal(message: impl Into<String>) -> Self {
-        Self {
-            code: tonic::Code::Internal,
             message: message.into(),
         }
     }
@@ -1325,14 +1314,20 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
     ) -> Result<tonic::Response<raft_internal_proto::RaftRpcAckV1>, tonic::Status> {
         let envelope = request.into_inner();
         let raft_group_id = validate_raft_rpc_envelope(&self.registry, &envelope)?;
-        let request = decode_grpc_payload::<UrsulaAppendEntriesRequest>(&envelope.payload)?;
+        let payload = required(envelope.payload, "raft_rpc_envelope.payload")
+            .map_err(|err| GrpcRpcError::invalid_argument(err.to_string()))?;
+        let request = append_entries_request_from_proto(payload)?;
         let response = self
             .registry
             .append_entries(raft_group_id, request)
             .await
             .map_err(|err| tonic::Status::internal(err.to_string()))?;
         Ok(tonic::Response::new(raft_internal_proto::RaftRpcAckV1 {
-            payload: encode_grpc_payload(&response)?,
+            payload: Some(
+                raft_internal_proto::raft_rpc_ack_v1::Payload::AppendEntries(
+                    append_entries_response_to_proto(response),
+                ),
+            ),
         }))
     }
 
@@ -1342,14 +1337,18 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
     ) -> Result<tonic::Response<raft_internal_proto::RaftRpcAckV1>, tonic::Status> {
         let envelope = request.into_inner();
         let raft_group_id = validate_raft_rpc_envelope(&self.registry, &envelope)?;
-        let request = decode_grpc_payload::<UrsulaVoteRequest>(&envelope.payload)?;
+        let payload = required(envelope.payload, "raft_rpc_envelope.payload")
+            .map_err(|err| GrpcRpcError::invalid_argument(err.to_string()))?;
+        let request = vote_request_from_proto(payload)?;
         let response = self
             .registry
             .vote(raft_group_id, request)
             .await
             .map_err(|err| tonic::Status::internal(err.to_string()))?;
         Ok(tonic::Response::new(raft_internal_proto::RaftRpcAckV1 {
-            payload: encode_grpc_payload(&response)?,
+            payload: Some(raft_internal_proto::raft_rpc_ack_v1::Payload::Vote(
+                vote_response_to_proto(response),
+            )),
         }))
     }
 
@@ -1359,10 +1358,8 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
     ) -> Result<tonic::Response<raft_internal_proto::RaftFullSnapshotAckV1>, tonic::Status> {
         let request = request.into_inner();
         let raft_group_id = validate_raft_snapshot_request(&self.registry, &request)?;
-        let vote = decode_grpc_payload::<VoteOf<UrsulaRaftTypeConfig>>(&request.vote_payload)?;
-        let meta = decode_grpc_payload::<SnapshotMetaOf<UrsulaRaftTypeConfig>>(
-            &request.snapshot_meta_payload,
-        )?;
+        let vote = vote_from_required_proto(request.vote)?;
+        let meta = snapshot_meta_from_required_proto(request.snapshot_meta)?;
         let snapshot = SnapshotOf::<UrsulaRaftTypeConfig> {
             meta,
             snapshot: Cursor::new(request.snapshot_payload),
@@ -1374,7 +1371,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             .map_err(|err| tonic::Status::internal(err.to_string()))?;
         Ok(tonic::Response::new(
             raft_internal_proto::RaftFullSnapshotAckV1 {
-                payload: encode_grpc_payload(&response)?,
+                response: Some(snapshot_response_to_proto(response)),
             },
         ))
     }
@@ -1500,7 +1497,7 @@ fn validate_raft_rpc_envelope(
     registry: &RaftGroupHandleRegistry,
     envelope: &raft_internal_proto::RaftRpcEnvelopeV1,
 ) -> Result<RaftGroupId, GrpcRpcError> {
-    validate_grpc_metadata(envelope.protocol_version, &envelope.payload_codec)?;
+    validate_grpc_metadata(envelope.protocol_version)?;
     let raft_group_id = RaftGroupId(envelope.raft_group_id);
     if !registry.contains_group(raft_group_id) {
         return Err(GrpcRpcError::not_found(format!(
@@ -1515,7 +1512,7 @@ fn validate_raft_snapshot_request(
     registry: &RaftGroupHandleRegistry,
     request: &raft_internal_proto::RaftFullSnapshotRequestV1,
 ) -> Result<RaftGroupId, GrpcRpcError> {
-    validate_grpc_metadata(request.protocol_version, &request.payload_codec)?;
+    validate_grpc_metadata(request.protocol_version)?;
     let raft_group_id = RaftGroupId(request.raft_group_id);
     if !registry.contains_group(raft_group_id) {
         return Err(GrpcRpcError::not_found(format!(
@@ -1526,29 +1523,14 @@ fn validate_raft_snapshot_request(
     Ok(raft_group_id)
 }
 
-fn validate_grpc_metadata(protocol_version: u32, payload_codec: &str) -> Result<(), GrpcRpcError> {
+fn validate_grpc_metadata(protocol_version: u32) -> Result<(), GrpcRpcError> {
     if protocol_version != RAFT_GRPC_PROTOCOL_VERSION {
         return Err(GrpcRpcError::failed_precondition(format!(
             "raft grpc protocol mismatch: local={}, remote={protocol_version}",
             RAFT_GRPC_PROTOCOL_VERSION
         )));
     }
-    if payload_codec != RAFT_RPC_PAYLOAD_CODEC {
-        return Err(GrpcRpcError::invalid_argument(format!(
-            "unsupported raft grpc payload codec: {payload_codec}"
-        )));
-    }
     Ok(())
-}
-
-fn encode_grpc_payload<T: Serialize>(value: &T) -> Result<Vec<u8>, GrpcRpcError> {
-    rmp_serde::to_vec_named(value)
-        .map_err(|err| GrpcRpcError::internal(format!("encode raft grpc payload: {err}")))
-}
-
-fn decode_grpc_payload<T: DeserializeOwned>(payload: &[u8]) -> Result<T, GrpcRpcError> {
-    rmp_serde::from_slice(payload)
-        .map_err(|err| GrpcRpcError::invalid_argument(format!("decode raft grpc payload: {err}")))
 }
 
 #[derive(Debug, Clone)]
@@ -1619,20 +1601,31 @@ impl GrpcRaftNetwork {
             .map_err(|err| RPCError::Unreachable(Unreachable::from_string(err)))
     }
 
-    fn envelope<T: Serialize>(
+    fn append_envelope(
         &self,
-        request: &T,
-        route: &str,
-    ) -> Result<raft_internal_proto::RaftRpcEnvelopeV1, RPCError<UrsulaRaftTypeConfig>> {
-        let payload = rmp_serde::to_vec_named(request)
-            .map_err(|err| raft_rpc_network_error(format!("serialize {route}: {err}")))?;
-        Ok(raft_internal_proto::RaftRpcEnvelopeV1 {
+        request: UrsulaAppendEntriesRequest,
+    ) -> raft_internal_proto::RaftRpcEnvelopeV1 {
+        raft_internal_proto::RaftRpcEnvelopeV1 {
             raft_group_id: self.raft_group_id.0,
             node_id: self.target,
             protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
-            payload_codec: RAFT_RPC_PAYLOAD_CODEC.to_owned(),
-            payload,
-        })
+            payload: Some(
+                raft_internal_proto::raft_rpc_envelope_v1::Payload::AppendEntries(
+                    append_entries_request_to_proto(request),
+                ),
+            ),
+        }
+    }
+
+    fn vote_envelope(&self, request: UrsulaVoteRequest) -> raft_internal_proto::RaftRpcEnvelopeV1 {
+        raft_internal_proto::RaftRpcEnvelopeV1 {
+            raft_group_id: self.raft_group_id.0,
+            node_id: self.target,
+            protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
+            payload: Some(raft_internal_proto::raft_rpc_envelope_v1::Payload::Vote(
+                vote_request_to_proto(request),
+            )),
+        }
     }
 
     fn apply_rpc_timeout<T>(&self, request: &mut tonic::Request<T>, option: RPCOption) {
@@ -1655,19 +1648,6 @@ impl GrpcRaftNetwork {
             _ => raft_rpc_network_error(message),
         }
     }
-
-    fn decode_ack<T: DeserializeOwned>(
-        &self,
-        route: &str,
-        payload: Vec<u8>,
-    ) -> Result<T, RPCError<UrsulaRaftTypeConfig>> {
-        rmp_serde::from_slice(&payload).map_err(|err| {
-            raft_rpc_network_error(format!(
-                "decode {route} response from node {} at {}: {err}",
-                self.target, self.endpoint
-            ))
-        })
-    }
 }
 
 fn normalize_grpc_endpoint(address: String) -> String {
@@ -1689,7 +1669,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
         rpc: UrsulaAppendEntriesRequest,
         option: RPCOption,
     ) -> Result<UrsulaAppendEntriesResponse, RPCError<UrsulaRaftTypeConfig>> {
-        let mut request = tonic::Request::new(self.envelope(&rpc, "Append")?);
+        let mut request = tonic::Request::new(self.append_envelope(rpc));
         self.apply_rpc_timeout(&mut request, option);
         let response = self
             .client()?
@@ -1697,7 +1677,22 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
             .await
             .map_err(|err| self.map_tonic_status("Append", err))?
             .into_inner();
-        self.decode_ack("Append", response.payload)
+        match required(response.payload, "raft append ack payload")
+            .map_err(|err| raft_rpc_network_error(err.to_string()))?
+        {
+            raft_internal_proto::raft_rpc_ack_v1::Payload::AppendEntries(response) => {
+                append_entries_response_from_proto(response).map_err(|err| {
+                    raft_rpc_network_error(format!(
+                        "decode Append response from node {} at {}: {err}",
+                        self.target, self.endpoint
+                    ))
+                })
+            }
+            _ => Err(raft_rpc_network_error(format!(
+                "Append response from node {} at {} had wrong payload type",
+                self.target, self.endpoint
+            ))),
+        }
     }
 
     async fn vote(
@@ -1705,7 +1700,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
         rpc: UrsulaVoteRequest,
         option: RPCOption,
     ) -> Result<UrsulaVoteResponse, RPCError<UrsulaRaftTypeConfig>> {
-        let mut request = tonic::Request::new(self.envelope(&rpc, "Vote")?);
+        let mut request = tonic::Request::new(self.vote_envelope(rpc));
         self.apply_rpc_timeout(&mut request, option);
         let response = self
             .client()?
@@ -1713,7 +1708,22 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
             .await
             .map_err(|err| self.map_tonic_status("Vote", err))?
             .into_inner();
-        self.decode_ack("Vote", response.payload)
+        match required(response.payload, "raft vote ack payload")
+            .map_err(|err| raft_rpc_network_error(err.to_string()))?
+        {
+            raft_internal_proto::raft_rpc_ack_v1::Payload::Vote(response) => {
+                vote_response_from_proto(response).map_err(|err| {
+                    raft_rpc_network_error(format!(
+                        "decode Vote response from node {} at {}: {err}",
+                        self.target, self.endpoint
+                    ))
+                })
+            }
+            _ => Err(raft_rpc_network_error(format!(
+                "Vote response from node {} at {} had wrong payload type",
+                self.target, self.endpoint
+            ))),
+        }
     }
 
     async fn full_snapshot(
@@ -1727,17 +1737,8 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
             raft_group_id: self.raft_group_id.0,
             node_id: self.target,
             protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
-            payload_codec: RAFT_RPC_PAYLOAD_CODEC.to_owned(),
-            vote_payload: rmp_serde::to_vec_named(&vote).map_err(|err| {
-                StreamingError::from(raft_rpc_network_error(format!(
-                    "serialize FullSnapshot vote: {err}"
-                )))
-            })?,
-            snapshot_meta_payload: rmp_serde::to_vec_named(&snapshot.meta).map_err(|err| {
-                StreamingError::from(raft_rpc_network_error(format!(
-                    "serialize FullSnapshot metadata: {err}"
-                )))
-            })?,
+            vote: Some(vote_to_proto(vote)),
+            snapshot_meta: Some(snapshot_meta_to_proto(snapshot.meta)),
             snapshot_payload: snapshot.snapshot.into_inner(),
         };
         let mut request = tonic::Request::new(request);
@@ -1749,8 +1750,12 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
             .await
             .map_err(|err| StreamingError::from(self.map_tonic_status("FullSnapshot", err)))?
             .into_inner();
-        self.decode_ack("FullSnapshot", response.payload)
-            .map_err(StreamingError::from)
+        snapshot_response_from_required_proto(response.response).map_err(|err| {
+            StreamingError::from(raft_rpc_network_error(format!(
+                "decode FullSnapshot response from node {} at {}: {err}",
+                self.target, self.endpoint
+            )))
+        })
     }
 }
 
@@ -1762,89 +1767,468 @@ struct RaftGroupLogStoreInner {
     vote: Option<VoteOf<UrsulaRaftTypeConfig>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "operation", rename_all = "snake_case")]
-enum RaftGroupLogRecord {
-    SaveVote {
-        vote: VoteOf<UrsulaRaftTypeConfig>,
-    },
-    SaveCommitted {
-        committed: Option<LogIdOf<UrsulaRaftTypeConfig>>,
-    },
-    Append {
-        entries: Vec<StoredLogEntry>,
-    },
-    TruncateAfter {
-        last_log_id: Option<LogIdOf<UrsulaRaftTypeConfig>>,
-    },
-    Purge {
-        log_id: LogIdOf<UrsulaRaftTypeConfig>,
-    },
-}
+type RaftGroupLogRecord = raft_internal_proto::RaftGroupLogRecordV1;
+type CoreJournalRecord = raft_internal_proto::CoreJournalRecordV1;
+type StoredLogEntry = raft_internal_proto::StoredLogEntryV1;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CoreJournalRecord {
-    group_id: u32,
-    record: RaftGroupLogRecord,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoredLogEntry {
-    log_id: LogIdOf<UrsulaRaftTypeConfig>,
-    payload: StoredEntryPayload,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "payload", rename_all = "snake_case")]
-enum StoredEntryPayload {
-    Blank,
-    Normal {
-        command: Vec<u8>,
-    },
-    Membership {
-        configs: Vec<BTreeSet<u64>>,
-        nodes: Vec<(u64, BasicNode)>,
-    },
-}
-
-impl From<&EntryOf<UrsulaRaftTypeConfig>> for StoredLogEntry {
+impl From<&EntryOf<UrsulaRaftTypeConfig>> for raft_internal_proto::StoredLogEntryV1 {
     fn from(entry: &EntryOf<UrsulaRaftTypeConfig>) -> Self {
+        use raft_internal_proto::stored_log_entry_v1::Payload;
+
         let payload = match &entry.payload {
-            EntryPayload::Blank => StoredEntryPayload::Blank,
-            EntryPayload::Normal(command) => StoredEntryPayload::Normal {
-                command: command.0.encode_to_vec(),
-            },
-            EntryPayload::Membership(membership) => StoredEntryPayload::Membership {
-                configs: membership.get_joint_config().clone(),
-                nodes: membership
-                    .nodes()
-                    .map(|(node_id, node)| (*node_id, node.clone()))
-                    .collect(),
-            },
+            EntryPayload::Blank => Payload::Blank(raft_internal_proto::BlankEntryV1 {}),
+            EntryPayload::Normal(command) => Payload::Normal(command.0.clone()),
+            EntryPayload::Membership(membership) => {
+                Payload::Membership(raft_internal_proto::MembershipEntryV1 {
+                    configs: membership
+                        .get_joint_config()
+                        .iter()
+                        .map(|config| raft_internal_proto::MembershipConfigV1 {
+                            node_ids: config.iter().copied().collect(),
+                        })
+                        .collect(),
+                    nodes: membership
+                        .nodes()
+                        .map(|(node_id, node)| raft_internal_proto::MembershipNodeV1 {
+                            node_id: *node_id,
+                            node: Some(raft_internal_proto::BasicNodeV1 {
+                                addr: node.addr.clone(),
+                            }),
+                        })
+                        .collect(),
+                })
+            }
         };
         Self {
-            log_id: entry.log_id,
-            payload,
+            log_id: Some(log_id_to_proto(entry.log_id)),
+            payload: Some(payload),
         }
     }
 }
 
-impl StoredLogEntry {
-    fn into_entry(self) -> Result<EntryOf<UrsulaRaftTypeConfig>, io::Error> {
-        let payload = match self.payload {
-            StoredEntryPayload::Blank => EntryPayload::Blank,
-            StoredEntryPayload::Normal { command } => {
-                let command = raft_app_proto::RaftGroupCommandV1::decode(command.as_slice())
-                    .map_err(invalid_data)?;
-                EntryPayload::Normal(RaftGroupCommand(command))
+fn stored_log_entry_into_entry(
+    entry: StoredLogEntry,
+) -> Result<EntryOf<UrsulaRaftTypeConfig>, io::Error> {
+    use raft_internal_proto::stored_log_entry_v1::Payload;
+
+    let log_id = log_id_from_required_proto(entry.log_id, "stored log entry log_id")?;
+    let payload = match entry.payload.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stored log entry missing payload",
+        )
+    })? {
+        Payload::Blank(_) => EntryPayload::Blank,
+        Payload::Normal(command) => EntryPayload::Normal(RaftGroupCommand(command)),
+        Payload::Membership(membership) => {
+            let configs = membership
+                .configs
+                .into_iter()
+                .map(|config| config.node_ids.into_iter().collect::<BTreeSet<_>>())
+                .collect::<Vec<_>>();
+            let nodes = membership
+                .nodes
+                .into_iter()
+                .map(|node| {
+                    let basic_node = node.node.ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "membership node missing basic node",
+                        )
+                    })?;
+                    Ok((
+                        node.node_id,
+                        BasicNode {
+                            addr: basic_node.addr,
+                        },
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>, io::Error>>()?;
+            let membership = Membership::new(configs, nodes).map_err(invalid_data)?;
+            EntryPayload::Membership(membership)
+        }
+    };
+    Ok(Entry::new(log_id, payload))
+}
+
+fn log_id_to_proto(log_id: LogIdOf<UrsulaRaftTypeConfig>) -> raft_internal_proto::LogIdV1 {
+    raft_internal_proto::LogIdV1 {
+        term: log_id.leader_id.term(),
+        node_id: *log_id.leader_id.node_id(),
+        index: log_id.index,
+    }
+}
+
+fn log_id_from_required_proto(
+    log_id: Option<raft_internal_proto::LogIdV1>,
+    field: &'static str,
+) -> Result<LogIdOf<UrsulaRaftTypeConfig>, io::Error> {
+    let log_id = log_id
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("{field} is missing")))?;
+    let leader_id = <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::LeaderId::new(
+        log_id.term,
+        log_id.node_id,
+    );
+    Ok(LogIdOf::<UrsulaRaftTypeConfig> {
+        leader_id,
+        index: log_id.index,
+    })
+}
+
+fn vote_to_proto(vote: VoteOf<UrsulaRaftTypeConfig>) -> raft_internal_proto::VoteV1 {
+    raft_internal_proto::VoteV1 {
+        term: vote.leader_id.term(),
+        node_id: *vote.leader_id.node_id(),
+        committed: vote.committed,
+    }
+}
+
+fn vote_from_required_proto(
+    vote: Option<raft_internal_proto::VoteV1>,
+) -> Result<VoteOf<UrsulaRaftTypeConfig>, io::Error> {
+    let vote = vote.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "save_vote record missing vote")
+    })?;
+    if vote.committed {
+        Ok(VoteOf::<UrsulaRaftTypeConfig>::new_committed(
+            vote.term,
+            vote.node_id,
+        ))
+    } else {
+        Ok(VoteOf::<UrsulaRaftTypeConfig>::new(vote.term, vote.node_id))
+    }
+}
+
+fn membership_to_proto(
+    membership: &Membership<u64, BasicNode>,
+) -> raft_internal_proto::MembershipEntryV1 {
+    raft_internal_proto::MembershipEntryV1 {
+        configs: membership
+            .get_joint_config()
+            .iter()
+            .map(|config| raft_internal_proto::MembershipConfigV1 {
+                node_ids: config.iter().copied().collect(),
+            })
+            .collect(),
+        nodes: membership
+            .nodes()
+            .map(|(node_id, node)| raft_internal_proto::MembershipNodeV1 {
+                node_id: *node_id,
+                node: Some(raft_internal_proto::BasicNodeV1 {
+                    addr: node.addr.clone(),
+                }),
+            })
+            .collect(),
+    }
+}
+
+fn membership_from_proto(
+    membership: raft_internal_proto::MembershipEntryV1,
+) -> Result<Membership<u64, BasicNode>, io::Error> {
+    let configs = membership
+        .configs
+        .into_iter()
+        .map(|config| config.node_ids.into_iter().collect::<BTreeSet<_>>())
+        .collect::<Vec<_>>();
+    let nodes = membership
+        .nodes
+        .into_iter()
+        .map(|node| {
+            let basic_node = node.node.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "membership node missing basic node",
+                )
+            })?;
+            Ok((
+                node.node_id,
+                BasicNode {
+                    addr: basic_node.addr,
+                },
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, io::Error>>()?;
+    Membership::new(configs, nodes).map_err(invalid_data)
+}
+
+fn stored_membership_to_proto(
+    membership: StoredMembershipOf<UrsulaRaftTypeConfig>,
+) -> raft_internal_proto::StoredMembershipV1 {
+    raft_internal_proto::StoredMembershipV1 {
+        log_id: membership
+            .log_id()
+            .as_ref()
+            .map(|log_id| log_id_to_proto(log_id.clone())),
+        membership: Some(membership_to_proto(membership.membership())),
+    }
+}
+
+fn stored_membership_from_required_proto(
+    membership: Option<raft_internal_proto::StoredMembershipV1>,
+) -> Result<StoredMembershipOf<UrsulaRaftTypeConfig>, io::Error> {
+    let membership = membership.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "snapshot meta missing last_membership",
+        )
+    })?;
+    let log_id = membership
+        .log_id
+        .map(|log_id| log_id_from_required_proto(Some(log_id), "stored membership log id"))
+        .transpose()?;
+    let inner = membership.membership.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stored membership missing membership",
+        )
+    })?;
+    Ok(StoredMembership::new(log_id, membership_from_proto(inner)?))
+}
+
+fn snapshot_meta_to_proto(
+    meta: SnapshotMetaOf<UrsulaRaftTypeConfig>,
+) -> raft_internal_proto::SnapshotMetaV1 {
+    raft_internal_proto::SnapshotMetaV1 {
+        last_log_id: meta.last_log_id.map(log_id_to_proto),
+        last_membership: Some(stored_membership_to_proto(meta.last_membership)),
+        snapshot_id: meta.snapshot_id,
+    }
+}
+
+fn snapshot_meta_from_required_proto(
+    meta: Option<raft_internal_proto::SnapshotMetaV1>,
+) -> Result<SnapshotMetaOf<UrsulaRaftTypeConfig>, io::Error> {
+    let meta =
+        meta.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "snapshot meta is missing"))?;
+    Ok(SnapshotMetaOf::<UrsulaRaftTypeConfig> {
+        last_log_id: meta
+            .last_log_id
+            .map(|log_id| log_id_from_required_proto(Some(log_id), "snapshot last log id"))
+            .transpose()?,
+        last_membership: stored_membership_from_required_proto(meta.last_membership)?,
+        snapshot_id: meta.snapshot_id,
+    })
+}
+
+fn append_entries_request_to_proto(
+    request: UrsulaAppendEntriesRequest,
+) -> raft_internal_proto::RaftAppendEntriesRequestV1 {
+    raft_internal_proto::RaftAppendEntriesRequestV1 {
+        vote: Some(vote_to_proto(request.vote)),
+        prev_log_id: request.prev_log_id.map(log_id_to_proto),
+        entries: request.entries.iter().map(StoredLogEntry::from).collect(),
+        leader_commit: request.leader_commit.map(log_id_to_proto),
+    }
+}
+
+fn append_entries_request_from_proto(
+    request: raft_internal_proto::raft_rpc_envelope_v1::Payload,
+) -> Result<UrsulaAppendEntriesRequest, GrpcRpcError> {
+    let raft_internal_proto::raft_rpc_envelope_v1::Payload::AppendEntries(request) = request else {
+        return Err(GrpcRpcError::invalid_argument(
+            "raft append envelope had wrong payload type",
+        ));
+    };
+    let entries = request
+        .entries
+        .into_iter()
+        .map(stored_log_entry_into_entry)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| GrpcRpcError::invalid_argument(format!("decode append entries: {err}")))?;
+    Ok(UrsulaAppendEntriesRequest {
+        vote: vote_from_required_proto(request.vote)
+            .map_err(|err| GrpcRpcError::invalid_argument(err.to_string()))?,
+        prev_log_id: request
+            .prev_log_id
+            .map(|log_id| log_id_from_required_proto(Some(log_id), "append prev_log_id"))
+            .transpose()
+            .map_err(|err| GrpcRpcError::invalid_argument(err.to_string()))?,
+        entries,
+        leader_commit: request
+            .leader_commit
+            .map(|log_id| log_id_from_required_proto(Some(log_id), "append leader_commit"))
+            .transpose()
+            .map_err(|err| GrpcRpcError::invalid_argument(err.to_string()))?,
+    })
+}
+
+fn append_entries_response_to_proto(
+    response: UrsulaAppendEntriesResponse,
+) -> raft_internal_proto::RaftAppendEntriesResponseV1 {
+    use raft_internal_proto::raft_append_entries_response_v1::Response;
+
+    let response = match response {
+        AppendEntriesResponse::Success => {
+            Response::Success(raft_internal_proto::RaftAppendSuccessV1 {})
+        }
+        AppendEntriesResponse::PartialSuccess(log_id) => {
+            Response::PartialSuccess(raft_internal_proto::RaftAppendPartialSuccessV1 {
+                log_id: log_id.map(log_id_to_proto),
+            })
+        }
+        AppendEntriesResponse::Conflict => {
+            Response::Conflict(raft_internal_proto::RaftAppendConflictV1 {})
+        }
+        AppendEntriesResponse::HigherVote(vote) => {
+            Response::HigherVote(raft_internal_proto::RaftAppendHigherVoteV1 {
+                vote: Some(vote_to_proto(vote)),
+            })
+        }
+    };
+    raft_internal_proto::RaftAppendEntriesResponseV1 {
+        response: Some(response),
+    }
+}
+
+fn append_entries_response_from_proto(
+    response: raft_internal_proto::RaftAppendEntriesResponseV1,
+) -> Result<UrsulaAppendEntriesResponse, io::Error> {
+    use raft_internal_proto::raft_append_entries_response_v1::Response;
+
+    Ok(
+        match response.response.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "append entries response missing response",
+            )
+        })? {
+            Response::Success(_) => AppendEntriesResponse::Success,
+            Response::PartialSuccess(response) => AppendEntriesResponse::PartialSuccess(
+                response
+                    .log_id
+                    .map(|log_id| {
+                        log_id_from_required_proto(Some(log_id), "partial success log id")
+                    })
+                    .transpose()?,
+            ),
+            Response::Conflict(_) => AppendEntriesResponse::Conflict,
+            Response::HigherVote(response) => {
+                AppendEntriesResponse::HigherVote(vote_from_required_proto(response.vote)?)
             }
-            StoredEntryPayload::Membership { configs, nodes } => {
-                let nodes = nodes.into_iter().collect::<BTreeMap<_, _>>();
-                let membership = Membership::new(configs, nodes).map_err(invalid_data)?;
-                EntryPayload::Membership(membership)
-            }
-        };
-        Ok(Entry::new(self.log_id, payload))
+        },
+    )
+}
+
+fn vote_request_to_proto(request: UrsulaVoteRequest) -> raft_internal_proto::RaftVoteRequestV1 {
+    raft_internal_proto::RaftVoteRequestV1 {
+        vote: Some(vote_to_proto(request.vote)),
+        last_log_id: request.last_log_id.map(log_id_to_proto),
+    }
+}
+
+fn vote_request_from_proto(
+    request: raft_internal_proto::raft_rpc_envelope_v1::Payload,
+) -> Result<UrsulaVoteRequest, GrpcRpcError> {
+    let raft_internal_proto::raft_rpc_envelope_v1::Payload::Vote(request) = request else {
+        return Err(GrpcRpcError::invalid_argument(
+            "raft vote envelope had wrong payload type",
+        ));
+    };
+    Ok(UrsulaVoteRequest {
+        vote: vote_from_required_proto(request.vote)
+            .map_err(|err| GrpcRpcError::invalid_argument(err.to_string()))?,
+        last_log_id: request
+            .last_log_id
+            .map(|log_id| log_id_from_required_proto(Some(log_id), "vote last_log_id"))
+            .transpose()
+            .map_err(|err| GrpcRpcError::invalid_argument(err.to_string()))?,
+    })
+}
+
+fn vote_response_to_proto(response: UrsulaVoteResponse) -> raft_internal_proto::RaftVoteResponseV1 {
+    raft_internal_proto::RaftVoteResponseV1 {
+        vote: Some(vote_to_proto(response.vote)),
+        vote_granted: response.vote_granted,
+        last_log_id: response.last_log_id.map(log_id_to_proto),
+    }
+}
+
+fn vote_response_from_proto(
+    response: raft_internal_proto::RaftVoteResponseV1,
+) -> Result<UrsulaVoteResponse, io::Error> {
+    Ok(UrsulaVoteResponse {
+        vote: vote_from_required_proto(response.vote)?,
+        vote_granted: response.vote_granted,
+        last_log_id: response
+            .last_log_id
+            .map(|log_id| log_id_from_required_proto(Some(log_id), "vote response last_log_id"))
+            .transpose()?,
+    })
+}
+
+fn snapshot_response_to_proto(
+    response: SnapshotResponse<UrsulaRaftTypeConfig>,
+) -> raft_internal_proto::RaftSnapshotResponseV1 {
+    raft_internal_proto::RaftSnapshotResponseV1 {
+        vote: Some(vote_to_proto(response.vote)),
+    }
+}
+
+fn snapshot_response_from_required_proto(
+    response: Option<raft_internal_proto::RaftSnapshotResponseV1>,
+) -> Result<SnapshotResponse<UrsulaRaftTypeConfig>, io::Error> {
+    let response = response.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "snapshot response missing response",
+        )
+    })?;
+    Ok(SnapshotResponse::new(vote_from_required_proto(
+        response.vote,
+    )?))
+}
+
+fn save_vote_record(vote: VoteOf<UrsulaRaftTypeConfig>) -> RaftGroupLogRecord {
+    use raft_internal_proto::raft_group_log_record_v1::Operation;
+
+    RaftGroupLogRecord {
+        operation: Some(Operation::SaveVote(raft_internal_proto::SaveVoteRecordV1 {
+            vote: Some(vote_to_proto(vote)),
+        })),
+    }
+}
+
+fn save_committed_record(committed: Option<LogIdOf<UrsulaRaftTypeConfig>>) -> RaftGroupLogRecord {
+    use raft_internal_proto::raft_group_log_record_v1::Operation;
+
+    RaftGroupLogRecord {
+        operation: Some(Operation::SaveCommitted(
+            raft_internal_proto::SaveCommittedRecordV1 {
+                committed: committed.map(log_id_to_proto),
+            },
+        )),
+    }
+}
+
+fn append_record(entries: Vec<StoredLogEntry>) -> RaftGroupLogRecord {
+    use raft_internal_proto::raft_group_log_record_v1::Operation;
+
+    RaftGroupLogRecord {
+        operation: Some(Operation::Append(raft_internal_proto::AppendRecordV1 {
+            entries,
+        })),
+    }
+}
+
+fn truncate_after_record(last_log_id: Option<LogIdOf<UrsulaRaftTypeConfig>>) -> RaftGroupLogRecord {
+    use raft_internal_proto::raft_group_log_record_v1::Operation;
+
+    RaftGroupLogRecord {
+        operation: Some(Operation::TruncateAfter(
+            raft_internal_proto::TruncateAfterRecordV1 {
+                last_log_id: last_log_id.map(log_id_to_proto),
+            },
+        )),
+    }
+}
+
+fn purge_record(log_id: LogIdOf<UrsulaRaftTypeConfig>) -> RaftGroupLogRecord {
+    use raft_internal_proto::raft_group_log_record_v1::Operation;
+
+    RaftGroupLogRecord {
+        operation: Some(Operation::Purge(raft_internal_proto::PurgeRecordV1 {
+            log_id: Some(log_id_to_proto(log_id)),
+        })),
     }
 }
 
@@ -2223,9 +2607,9 @@ fn write_core_log_batch(
     for request in batch {
         let journal_record = CoreJournalRecord {
             group_id: request.group_id,
-            record: request.record.clone(),
+            record: Some(request.record.clone()),
         };
-        write_binary_frame_to_file(journal_path, journal_handle, &journal_record)?;
+        write_protobuf_frame_to_file(journal_path, journal_handle, &journal_record)?;
     }
     let write_ns = elapsed_ns(write_started_at);
 
@@ -2289,7 +2673,7 @@ impl RaftLogStorage<UrsulaRaftTypeConfig> for Arc<RaftGroupFileLogStore> {
             }
             let mut next = inner.clone();
             next.vote = Some(vote);
-            store.append_record_locked(&RaftGroupLogRecord::SaveVote { vote })?;
+            store.append_record_locked(&save_vote_record(vote))?;
             *inner = next;
             Ok(())
         })
@@ -2308,7 +2692,7 @@ impl RaftLogStorage<UrsulaRaftTypeConfig> for Arc<RaftGroupFileLogStore> {
             }
             let mut next = inner.clone();
             next.committed = committed;
-            store.append_record_locked(&RaftGroupLogRecord::SaveCommitted { committed })?;
+            store.append_record_locked(&save_committed_record(committed))?;
             *inner = next;
             Ok(())
         })
@@ -2336,9 +2720,7 @@ impl RaftLogStorage<UrsulaRaftTypeConfig> for Arc<RaftGroupFileLogStore> {
             let mut inner = store.lock_inner()?;
             ensure_log_append_boundary(&inner, &entries)?;
 
-            let record = RaftGroupLogRecord::Append {
-                entries: entries.iter().map(StoredLogEntry::from).collect(),
-            };
+            let record = append_record(entries.iter().map(StoredLogEntry::from).collect());
             if let Err(err) = store.append_record_locked(&record) {
                 callback.io_completed(Err(io::Error::new(err.kind(), err.to_string())));
                 return Err(err);
@@ -2362,7 +2744,7 @@ impl RaftLogStorage<UrsulaRaftTypeConfig> for Arc<RaftGroupFileLogStore> {
             let mut inner = store.lock_inner()?;
             let mut next = inner.clone();
             next.entries.retain(|index, _| *index < start_index);
-            store.append_record_locked(&RaftGroupLogRecord::TruncateAfter { last_log_id })?;
+            store.append_record_locked(&truncate_after_record(last_log_id))?;
             *inner = next;
             Ok(())
         })
@@ -2386,7 +2768,7 @@ impl RaftLogStorage<UrsulaRaftTypeConfig> for Arc<RaftGroupFileLogStore> {
             let mut next = inner.clone();
             next.last_purged_log_id = Some(log_id);
             next.entries.retain(|index, _| *index > log_id.index);
-            store.append_record_locked(&RaftGroupLogRecord::Purge { log_id })?;
+            store.append_record_locked(&purge_record(log_id))?;
             *inner = next;
             Ok(())
         })
@@ -2411,39 +2793,18 @@ fn load_log_store_inner(path: &Path) -> Result<RaftGroupLogStoreInner, io::Error
     }
 
     let bytes = fs::read(path)?;
-    if bytes.is_empty() {
-        return Ok(RaftGroupLogStoreInner::default());
-    }
-
-    if let Ok(inner) = serde_json::from_slice::<RaftGroupLogStoreInner>(&bytes) {
-        return Ok(inner);
-    }
-
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
     let mut inner = RaftGroupLogStoreInner::default();
-    for (line_index, line) in reader.lines().enumerate() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let record = serde_json::from_str::<RaftGroupLogRecord>(&line).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "decode OpenRaft log record '{}' line {}: {err}",
-                    path.display(),
-                    line_index + 1
-                ),
-            )
-        })?;
+    for (record_index, record) in read_protobuf_frames::<RaftGroupLogRecord>(&bytes)?
+        .into_iter()
+        .enumerate()
+    {
         apply_log_store_record(&mut inner, record).map_err(|err| {
             io::Error::new(
                 err.kind(),
                 format!(
-                    "replay OpenRaft log record '{}' line {}: {err}",
+                    "replay OpenRaft log record '{}' record {}: {err}",
                     path.display(),
-                    line_index + 1
+                    record_index + 1
                 ),
             )
         })?;
@@ -2465,53 +2826,30 @@ fn load_log_store_inner_from_core_journal(
     }
 
     let mut inner = RaftGroupLogStoreInner::default();
-    let mut cursor = Cursor::new(bytes.as_slice());
-    let mut record_index = 0usize;
-    while usize::try_from(cursor.position()).expect("cursor position fits usize") < bytes.len() {
-        let mut len_bytes = [0_u8; 4];
-        cursor.read_exact(&mut len_bytes).map_err(|err| {
-            io::Error::new(
-                err.kind(),
-                format!(
-                    "read OpenRaft core journal record length '{}' record {}: {err}",
-                    journal_path.display(),
-                    record_index + 1
-                ),
-            )
-        })?;
-        let len = usize::try_from(u32::from_le_bytes(len_bytes)).expect("u32 fits usize");
-        let mut record_bytes = vec![0_u8; len];
-        cursor.read_exact(&mut record_bytes).map_err(|err| {
-            io::Error::new(
-                err.kind(),
-                format!(
-                    "read OpenRaft core journal record '{}' record {}: {err}",
-                    journal_path.display(),
-                    record_index + 1
-                ),
-            )
-        })?;
-        let record = rmp_serde::from_slice::<CoreJournalRecord>(&record_bytes).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "decode OpenRaft core journal record '{}' record {}: {err}",
-                    journal_path.display(),
-                    record_index + 1
-                ),
-            )
-        })?;
-        record_index += 1;
+    for (record_index, record) in read_protobuf_frames::<CoreJournalRecord>(&bytes)?
+        .into_iter()
+        .enumerate()
+    {
         if record.group_id != placement.raft_group_id.0 {
             continue;
         }
-        apply_log_store_record(&mut inner, record.record).map_err(|err| {
+        let record_payload = record.record.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "OpenRaft core journal record '{}' record {} missing payload",
+                    journal_path.display(),
+                    record_index + 1
+                ),
+            )
+        })?;
+        apply_log_store_record(&mut inner, record_payload).map_err(|err| {
             io::Error::new(
                 err.kind(),
                 format!(
                     "replay OpenRaft core journal record '{}' record {}: {err}",
                     journal_path.display(),
-                    record_index
+                    record_index + 1
                 ),
             )
         })?;
@@ -2525,7 +2863,7 @@ fn append_log_store_record(
     record: &RaftGroupLogRecord,
 ) -> Result<(u64, u64), io::Error> {
     let write_started_at = Instant::now();
-    write_json_line_to_file(path, handle, record)?;
+    write_protobuf_frame_to_file(path, handle, record)?;
     let write_ns = elapsed_ns(write_started_at);
 
     let sync_started_at = Instant::now();
@@ -2533,10 +2871,10 @@ fn append_log_store_record(
     Ok((write_ns, elapsed_ns(sync_started_at)))
 }
 
-fn write_json_line_to_file<T: Serialize>(
+fn write_protobuf_frame_to_file<M: Message>(
     path: &Path,
     handle: &mut RaftGroupFileLogHandle,
-    value: &T,
+    value: &M,
 ) -> Result<(), io::Error> {
     if handle.file.is_none() {
         if let Some(parent) = path.parent() {
@@ -2548,30 +2886,45 @@ fn write_json_line_to_file<T: Serialize>(
         .file
         .as_mut()
         .expect("file handle is opened before write");
-    serde_json::to_writer(&mut *file, value).map_err(invalid_data)?;
-    file.write_all(b"\n")
-}
-
-fn write_binary_frame_to_file<T: Serialize>(
-    path: &Path,
-    handle: &mut RaftGroupFileLogHandle,
-    value: &T,
-) -> Result<(), io::Error> {
-    if handle.file.is_none() {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        handle.file = Some(OpenOptions::new().create(true).append(true).open(path)?);
-    }
-    let file = handle
-        .file
-        .as_mut()
-        .expect("file handle is opened before write");
-    let bytes = rmp_serde::to_vec(value).map_err(invalid_data)?;
-    let len = u32::try_from(bytes.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "core journal record too large"))?;
+    let bytes = value.encode_to_vec();
+    let len = u32::try_from(bytes.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "OpenRaft journal record too large",
+        )
+    })?;
     file.write_all(&len.to_le_bytes())?;
     file.write_all(&bytes)
+}
+
+fn read_protobuf_frames<M: Message + Default>(bytes: &[u8]) -> Result<Vec<M>, io::Error> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut cursor = Cursor::new(bytes);
+    let mut records = Vec::new();
+    while usize::try_from(cursor.position()).expect("cursor position fits usize") < bytes.len() {
+        let mut len_bytes = [0_u8; 4];
+        cursor.read_exact(&mut len_bytes)?;
+        let len = usize::try_from(u32::from_le_bytes(len_bytes)).expect("u32 fits usize");
+        let start = usize::try_from(cursor.position()).expect("cursor position fits usize");
+        let end = start.checked_add(len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "OpenRaft journal frame length overflow",
+            )
+        })?;
+        if end > bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "OpenRaft journal frame extends past end of file",
+            ));
+        }
+        records.push(M::decode(&bytes[start..end]).map_err(invalid_data)?);
+        cursor.set_position(u64::try_from(end).expect("frame end fits u64"));
+    }
+    Ok(records)
 }
 
 fn sync_file_handle(path: &Path, handle: &mut RaftGroupFileLogHandle) -> Result<(), io::Error> {
@@ -2591,12 +2944,12 @@ fn sync_file_handle(path: &Path, handle: &mut RaftGroupFileLogHandle) -> Result<
 }
 
 fn raft_group_log_record_count(record: &RaftGroupLogRecord) -> usize {
-    match record {
-        RaftGroupLogRecord::Append { entries } => entries.len(),
-        RaftGroupLogRecord::SaveVote { .. }
-        | RaftGroupLogRecord::SaveCommitted { .. }
-        | RaftGroupLogRecord::TruncateAfter { .. }
-        | RaftGroupLogRecord::Purge { .. } => 1,
+    match &record.operation {
+        Some(raft_internal_proto::raft_group_log_record_v1::Operation::Append(append)) => {
+            append.entries.len()
+        }
+        Some(_) => 1,
+        None => 0,
     }
 }
 
@@ -2608,19 +2961,30 @@ fn apply_log_store_record(
     inner: &mut RaftGroupLogStoreInner,
     record: RaftGroupLogRecord,
 ) -> Result<(), io::Error> {
-    match record {
-        RaftGroupLogRecord::SaveVote { vote } => {
-            inner.vote = Some(vote);
+    use raft_internal_proto::raft_group_log_record_v1::Operation;
+
+    match record.operation.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "OpenRaft log record missing operation",
+        )
+    })? {
+        Operation::SaveVote(record) => {
+            inner.vote = Some(vote_from_required_proto(record.vote)?);
             Ok(())
         }
-        RaftGroupLogRecord::SaveCommitted { committed } => {
-            inner.committed = committed;
+        Operation::SaveCommitted(record) => {
+            inner.committed = record
+                .committed
+                .map(|log_id| log_id_from_required_proto(Some(log_id), "committed log id"))
+                .transpose()?;
             Ok(())
         }
-        RaftGroupLogRecord::Append { entries } => {
-            let entries = entries
+        Operation::Append(record) => {
+            let entries = record
+                .entries
                 .into_iter()
-                .map(StoredLogEntry::into_entry)
+                .map(stored_log_entry_into_entry)
                 .collect::<Result<Vec<_>, _>>()?;
             ensure_consecutive_entries(&entries)?;
             for entry in entries {
@@ -2628,12 +2992,17 @@ fn apply_log_store_record(
             }
             ensure_consecutive_log(&inner.entries)
         }
-        RaftGroupLogRecord::TruncateAfter { last_log_id } => {
+        Operation::TruncateAfter(record) => {
+            let last_log_id = record
+                .last_log_id
+                .map(|log_id| log_id_from_required_proto(Some(log_id), "truncate_after log id"))
+                .transpose()?;
             let start_index = last_log_id.map_or(0, |log_id| log_id.index + 1);
             inner.entries.retain(|index, _| *index < start_index);
             Ok(())
         }
-        RaftGroupLogRecord::Purge { log_id } => {
+        Operation::Purge(record) => {
+            let log_id = log_id_from_required_proto(record.log_id, "purge log id")?;
             if inner.last_purged_log_id > Some(log_id) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -4815,7 +5184,7 @@ mod tests {
     }
 
     #[test]
-    fn raft_group_response_serde_uses_shared_protobuf_log_schema() {
+    fn raft_group_response_uses_shared_protobuf_log_schema() {
         let response = raft_write_applied_response(GroupWriteResponse::CreateStream(
             ursula_runtime::CreateStreamResponse {
                 placement: placement(),
@@ -4825,13 +5194,6 @@ mod tests {
                 group_commit_index: 11,
             },
         ));
-
-        let encoded_container =
-            rmp_serde::to_vec_named(&response).expect("encode response wrapper");
-        let decoded_container: RaftGroupResponse =
-            rmp_serde::from_slice(&encoded_container).expect("decode response wrapper");
-
-        assert_eq!(decoded_container, response);
 
         let mut encoded_proto = Vec::new();
         response
@@ -4843,7 +5205,9 @@ mod tests {
 
         assert_eq!(decoded_proto, response.0);
 
-        match group_write_result_from_raft_response(decoded_container).expect("domain response") {
+        match group_write_result_from_raft_response(RaftGroupResponse(decoded_proto))
+            .expect("domain response")
+        {
             Ok(GroupWriteResponse::CreateStream(response)) => {
                 assert_eq!(response.next_offset, 5);
                 assert_eq!(response.group_commit_index, 11);
@@ -4859,15 +5223,14 @@ mod tests {
             .as_nanos();
         std::env::temp_dir()
             .join("ursula-raft-tests")
-            .join(format!("{name}-{}-{nonce}.json", std::process::id()))
+            .join(format!("{name}-{}-{nonce}.bin", std::process::id()))
     }
 
-    fn non_empty_line_count(path: &Path) -> usize {
-        fs::read_to_string(path)
-            .expect("read log file")
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .count()
+    fn protobuf_frame_count<M: Message + Default>(path: &Path) -> usize {
+        let bytes = fs::read(path).expect("read log file");
+        read_protobuf_frames::<M>(&bytes)
+            .expect("decode protobuf frames")
+            .len()
     }
 
     #[derive(Debug, Clone, Default)]
@@ -5140,7 +5503,7 @@ mod tests {
                 .await
                 .expect("save committed");
         }
-        assert_eq!(non_empty_line_count(&path), 3);
+        assert_eq!(protobuf_frame_count::<RaftGroupLogRecord>(&path), 3);
 
         let mut reopened = RaftGroupFileLogStore::shared(&path).expect("reopen file log store");
         let state = reopened.get_log_state().await.expect("log state");
@@ -5181,7 +5544,7 @@ mod tests {
                 .await
                 .expect("save duplicate committed");
         }
-        assert_eq!(non_empty_line_count(&path), 2);
+        assert_eq!(protobuf_frame_count::<RaftGroupLogRecord>(&path), 2);
 
         let mut reopened = RaftGroupFileLogStore::shared(&path).expect("reopen file log store");
         assert_eq!(reopened.read_vote().await.expect("vote"), Some(vote));
@@ -5226,7 +5589,7 @@ mod tests {
                 .expect("append after truncate");
             store.purge(log_id(2)).await.expect("purge file log");
         }
-        assert_eq!(non_empty_line_count(&path), 4);
+        assert_eq!(protobuf_frame_count::<RaftGroupLogRecord>(&path), 4);
 
         let mut reopened = RaftGroupFileLogStore::shared(&path).expect("reopen file log store");
         let state = reopened.get_log_state().await.expect("log state");

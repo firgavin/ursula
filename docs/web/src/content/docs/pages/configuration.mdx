@@ -17,7 +17,7 @@ defaults < environment variables < CLI flags
 | `--core-count N` | `available_parallelism` | Worker threads (each pinned to its mailbox event loop) |
 | `--raft-group-count N` | `core_count × 16` | Total Raft groups. Higher = better stream-to-group hash spread |
 | `--raft-memory` | off | In-memory Raft log. Volatile |
-| `--wal-dir DIR` | none | Per-group JSON log + per-core `journal.bin` for single-node persistence |
+| `--wal-dir DIR` | none | Per-group protobuf Raft log records + per-core `journal.bin` for single-node persistence |
 | `--raft-log-dir DIR` | none | Durable Raft log directory (use with static gRPC cluster) |
 | `--raft-node-id ID` | none | Required for static gRPC cluster mode |
 | `--raft-peer ID=URL` | none | Static peer list (repeatable: one per node, including self) |

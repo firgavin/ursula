@@ -10,7 +10,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
-        .compile_protos(&[proto], &["proto"])?;
+        .extern_path(".ursula.durable.v1", "::ursula_proto")
+        .compile_protos(&[proto], &["proto", "../ursula-proto/proto"])?;
 
     Ok(())
 }

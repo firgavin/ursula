@@ -31,7 +31,7 @@ cargo run -p ursula --bin ursula -- \
   --wal-dir ./data/wal
 ```
 
-The `--wal-dir` directory will contain one JSON log per Raft group plus a shared `journal.bin` per core. Removing the directory wipes state cleanly.
+The `--wal-dir` directory will contain protobuf-framed Raft log records per group plus a shared `journal.bin` per core. Removing the directory wipes state cleanly.
 
 ## Smoke test
 

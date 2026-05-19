@@ -173,26 +173,22 @@ the Raft transport protobuf. `ProducerRequestV1`, `ExternalPayloadRefV1`, and
 `BucketStreamId` remains a local semantic key in `ursula-shard` because it is
 used for hashing, display, validation, and map keys, but `ursula-shard` owns the
 conversion to and from shared `BucketStreamIdV1` so Raft does not duplicate that
-schema mapping. `RaftGroupCommandV1` and `RaftGroupResponseV1` are the shared protobuf
-application schema for Raft log commands and responses. `ursula-raft` keeps
-thin local `RaftGroupCommand` / `RaftGroupResponse` wrapper types only because
-OpenRaft needs local Rust trait implementations such as `Display`, and because
-OpenRaft's current serde-bound containers need wrapper serde implementations.
-Those wrapper serde implementations encode the shared prost messages as
-protobuf bytes; they do not derive or expose a second serde-shaped app-log
-schema. Focused tests cover the command prost roundtrip and the response
-`rmp-serde` container roundtrip back into runtime domain responses. In the
-generated proto crate, serde derives are kept only for the three shared runtime
-JSON/snapshot value types that still need them:
+schema mapping. `RaftGroupCommandV1` and `RaftGroupResponseV1` are the shared
+protobuf application schema for Raft log commands and responses. `ursula-raft`
+keeps thin local `RaftGroupCommand` / `RaftGroupResponse` wrapper types only
+because OpenRaft needs local Rust trait implementations such as `Display`.
+Focused tests cover prost roundtrips for those shared command/response schemas
+back into runtime domain types. In the generated proto crate, serde derives are
+kept only for the three shared runtime JSON/snapshot value types that still need
+them:
 `ProducerRequestV1`, `ExternalPayloadRefV1`, and `ColdChunkRefV1`.
 `UrsulaRaftTypeConfig` uses those wrappers as OpenRaft application data,
 `RaftGroupLogStore` provides an in-memory OpenRaft log-store implementation for
 the same type config, and `RaftGroupFileLogStore` persists the same vote,
-committed pointer, purge pointer, and log entries. The standalone file store
-still writes one append-only JSON journal per group for focused log-store tests.
-Normal application log entries in those journals store the shared
-`RaftGroupCommandV1` protobuf bytes, not a second serde encoding of the durable
-command schema.
+committed pointer, purge pointer, and log entries as length-prefixed protobuf
+records. Normal application log entries in those records embed the shared
+`RaftGroupCommandV1` prost message directly, not a second serde encoding or an
+opaque command byte blob.
 When used by `DurableRaftGroupEngineFactory`, groups on the same owner core now
 share a `CoreFileLogWriter` and a core-local `journal.bin`: the writer batches
 length-prefixed binary records from owned groups and syncs the core journal
@@ -219,13 +215,11 @@ serve AppendEntries, Vote, or full-snapshot messages for groups that have not
 yet received client traffic on the follower node.
 `router_with_raft_registry` wires that registry into an internal tonic gRPC
 service mounted on the same Axum listener as the public HTTP API. Vote,
-AppendEntries, and full-snapshot transfer use `RaftInternal` RPCs with
-protobuf metadata envelopes. The current OpenRaft RPC container and local
-journal payload bytes still use the transitional `openraft-rmp-serde-v1` codec
-because OpenRaft's request/response containers, log entries, vote, membership,
-and snapshot metadata are still serialized through its serde-enabled Rust type
-config. The durable application command schema itself is no longer a private
-Raft transport schema; it is the shared `ursula-proto` schema.
+AppendEntries, and full-snapshot transfer use typed `RaftInternal` protobuf
+messages for OpenRaft votes, log ids, log entries, membership, snapshot
+metadata, and responses. The durable application command schema itself is not a
+private Raft transport schema; it is the shared `ursula-proto` schema embedded
+inside those Raft protobuf records.
 `GrpcRaftNetworkFactory` and `GrpcRaftNetwork` implement the outbound OpenRaft
 network trait for those RPCs. `StaticGrpcRaftGroupEngineFactory` wires that
 network into runtime-owned group construction with a static peer map and carries
