@@ -1,7 +1,6 @@
 # Ursula
 
 [![Crates.io](https://img.shields.io/crates/v/ursula.svg)](https://crates.io/crates/ursula)
-[![Documentation](https://docs.rs/ursula/badge.svg)](https://docs.rs/ursula)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 📖 Docs: **[ursula.tonbo.io](https://ursula.tonbo.io)**
