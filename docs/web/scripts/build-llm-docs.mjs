@@ -19,7 +19,7 @@ const REPO_ROOT = join(__dirname, "..");
 const PAGES_DIR = join(REPO_ROOT, "src/content/docs/pages");
 const PUBLIC_DIR = join(REPO_ROOT, "public");
 const DIST_DIR = join(REPO_ROOT, "dist");
-const ORIGIN = "https://opendurability.github.io/ursula";
+const ORIGIN = "https://ursula.tonbo.io";
 
 const GROUP_ORDER = [
   "Getting Started",

@@ -1,7 +1,7 @@
 ---
 title: Ursula
 sidebarTitle: Introduction
-description: A thread-per-core, multi-Raft implementation of the Durable Streams protocol over HTTP, with optional S3-backed cold storage.
+description: A thread-per-core, multi-Raft implementation of the Durable Streams protocol over HTTP, with S3-backed cold storage.
 ---
 
 <Info>
@@ -10,7 +10,7 @@ Ursula is built by <a href="https://tonbo.io/" target="_blank" rel="noopener nor
 
 Ursula is an open-source implementation of the [Durable Streams Protocol](/docs/specs/durable-stream): URL-addressable, append-only byte streams that can be replayed, resumed, and tailed with plain HTTP.
 
-Run it as a single in-memory or WAL-backed node for local development, or as a static-membership Raft cluster for replicated writes, transparent leader forwarding, snapshot publication, and optional S3-backed cold storage.
+Run it as a single in-memory or WAL-backed node for local development, or as a static-membership Raft cluster for replicated writes, transparent leader forwarding, snapshot publication, and S3-backed cold storage.
 
 ## What it is
 
@@ -18,7 +18,7 @@ Run it as a single in-memory or WAL-backed node for local development, or as a s
 
 **One timeline per resource.** Give each document, session, workflow, room, or agent run its own durable stream.
 
-**Distributed serving.** Ursula adds per-group Raft replication, leader-only reads with transparent follower forwarding, snapshot publication, and optional cold offload to S3 around the Durable Streams primitive.
+**Distributed serving.** Ursula adds per-group Raft replication, leader-only reads with transparent follower forwarding, snapshot publication, and cold offload to S3 around the Durable Streams primitive.
 
 **Thread-per-core.** Streams are statically hashed to a Raft group, and each group is pinned to a specific core. Hot-path requests touch the owner core only. Cross-core synchronization is avoided by construction. See [architecture overview](/docs/architecture/overview) for the full layout.
 

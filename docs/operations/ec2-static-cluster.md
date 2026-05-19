@@ -14,7 +14,7 @@ multi-Raft deployment loop reproducible:
 
 The shape intentionally mirrors the current migration benchmarks: three server
 nodes, one optional client node, static Raft peer URLs, per-group membership
-initializers, and optional S3 cold storage.
+initializers, and S3 cold storage.
 
 ## Requirements
 

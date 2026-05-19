@@ -8,7 +8,7 @@
 
 ## What
 
-Ursula is a thread-per-core, multi-Raft server for the [Durable Streams Protocol](https://github.com/durable-streams/durable-streams): distributed, HTTP-native, append-only byte streams with quorum-replicated writes and optional S3-backed cold storage.
+Ursula is a thread-per-core, multi-Raft server for the [Durable Streams Protocol](https://github.com/durable-streams/durable-streams): distributed, HTTP-native, append-only byte streams with quorum-replicated writes and S3-backed cold storage.
 
 ## Why
 
