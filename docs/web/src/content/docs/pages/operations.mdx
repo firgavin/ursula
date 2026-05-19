@@ -69,7 +69,6 @@ python3 scripts/ursula_ec2.py --config cluster.json perf-many \
   --processes 4 --bucket-prefix benchcmp-mp
 ```
 
-The full manifest shape and command set are documented in `docs/operations/ec2-static-cluster.md` in the repository.
 `perf-many` rotates Ursula entrypoints across configured service nodes by default; use `--target-mode first` only when reproducing a single-ingress-node run.
 
 `stop` deliberately kills only the recorded PID - it does not `pkill`, because broad patterns can match the SSH command performing the cleanup. If a node's pid file is stale, kill the process by hand.

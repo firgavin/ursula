@@ -13,3 +13,6 @@ docs/web/vite.config.d.ts
 
 # Local benchmark output
 .bench-results/
+
+# Internal migration / architecture / operations notes
+docs/migration/

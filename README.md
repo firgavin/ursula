@@ -65,8 +65,6 @@ The `v0.1.x` line is a working prototype. The roadmap from here:
 - **Backup and restore tooling.** A supported recovery path for total-cluster loss from the S3 cold tier (today there is none).
 - **Client SDKs.** Ergonomic Rust and TypeScript clients on top of the HTTP API.
 
-Current status across every checklist item: [final goal audit](docs/migration/final-goal-audit.md).
-
 ## License
 
 Apache 2.0. See [LICENSE](LICENSE).

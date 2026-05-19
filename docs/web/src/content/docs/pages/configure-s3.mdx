@@ -52,7 +52,7 @@ The cold-flush worker runs in the background and decides when to move hot segmen
 | `URSULA_COLD_FLUSH_MAX_CONCURRENCY` | `4` | Parallel cold writes in flight |
 | `URSULA_COLD_MAX_HOT_BYTES_PER_GROUP` | `64 MiB` | Backpressure ceiling: appends to a group above this size return `503` until cold flush catches up |
 
-A typical benchmark profile (see `docs/operations/ec2-static-cluster.md`) drops the interval to `200ms`, raises concurrency to `32`, and bumps the per-group ceiling.
+A typical benchmark profile drops the interval to `200ms`, raises concurrency to `32`, and bumps the per-group ceiling.
 
 ## Operating notes
 

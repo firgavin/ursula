@@ -152,7 +152,7 @@ SSE clients first issue a normal read. If it returns an empty payload with `up_t
 
 Recent data sits in an in-memory ring on every replica. Once the ring exceeds its configured budget (`URSULA_COLD_MAX_HOT_BYTES_PER_GROUP`), the runtime flushes the oldest segments into an object-store chunk and replaces them in the read plan with a cold-segment reference. Reads then transparently fetch from hot memory and S3 in one response. Cold flushes are batched and rate-limited via the `ColdWriteAdmission` so a single burst cannot starve out other groups on the same core.
 
-For deployment topology - voting layout across AZs and regions, non-voting replicas, S3 prefix layout - see the [operations guide](/docs/operations) and `docs/operations/ec2-static-cluster.md` in the repository.
+For deployment topology - voting layout across AZs and regions, non-voting replicas, S3 prefix layout - see the [operations guide](/docs/operations).
 
 ## Status and trade-offs
 
